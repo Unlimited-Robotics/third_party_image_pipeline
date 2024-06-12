@@ -29,12 +29,14 @@
 // LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
 // ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+#include "depth_image_proc/point_cloud_xyz.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <image_geometry/pinhole_camera_model.h>
-#include <depth_image_proc/depth_conversions.hpp>
+#include <depth_image_proc/conversions.hpp>
 #include <depth_image_proc/visibility.h>
+#include <bits/stdc++.h>
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <memory>
@@ -42,103 +44,219 @@
 namespace depth_image_proc
 {
 
-namespace enc = sensor_msgs::image_encodings;
-
-class PointCloudXyzNode : public rclcpp::Node
-{
-public:
-  DEPTH_IMAGE_PROC_PUBLIC PointCloudXyzNode(const rclcpp::NodeOptions & options);
-
-private:
-  using PointCloud2 = sensor_msgs::msg::PointCloud2;
-  using Image = sensor_msgs::msg::Image;
-  using CameraInfo = sensor_msgs::msg::CameraInfo;
-
-  // Subscriptions
-  image_transport::CameraSubscriber sub_depth_;
-  int queue_size_;
-
-  // Publications
-  std::mutex connect_mutex_;
-  rclcpp::Publisher<PointCloud2>::SharedPtr pub_point_cloud_;
-
-  image_geometry::PinholeCameraModel model_;
-
-  void connectCb();
-
-  void depthCb(
-    const Image::ConstSharedPtr & depth_msg,
-    const CameraInfo::ConstSharedPtr & info_msg);
-
-  rclcpp::Logger logger_ = rclcpp::get_logger("PointCloudXyzNode");
-};
-
 PointCloudXyzNode::PointCloudXyzNode(const rclcpp::NodeOptions & options)
 : Node("PointCloudXyzNode", options)
 {
   // Read parameters
-  queue_size_ = this->declare_parameter<int>("queue_size", 5);
+  this->declare_parameter("queue_size", 1);
+  this->declare_parameter("stream_pointcloud", false);
+  this->declare_parameter("clip_distance", -2.0);
+  this->declare_parameter("min_x", 0);
+  this->declare_parameter("max_x", INT_MAX);
+  this->declare_parameter("min_y", 0);
+  this->declare_parameter("max_y", INT_MAX);
 
-  // Monitor whether anyone is subscribed to the output
-  // TODO(ros2) Implement when SubscriberStatusCallback is available
-  // ros::SubscriberStatusCallback connect_cb = boost::bind(&PointCloudXyzNode::connectCb, this);
-  connectCb();
+  queue_size_ = this->get_parameter("queue_size").as_int();
+  stream_pointcloud_ = this->get_parameter("stream_pointcloud").as_bool();
+  clip_distance_ = this->get_parameter("clip_distance").as_double();
+  min_x_ = this->get_parameter("min_x").as_int();
+  max_x_ = this->get_parameter("max_x").as_int();
+  min_y_ = this->get_parameter("min_y").as_int();
+  max_y_ = this->get_parameter("max_y").as_int();
 
-  // Make sure we don't enter connectCb() between advertising and assigning to pub_point_cloud_
-  std::lock_guard<std::mutex> lock(connect_mutex_);
-  // TODO(ros2) Implement when SubscriberStatusCallback is available
-  // pub_point_cloud_ = nh.advertise<PointCloud>("points", 1, connect_cb, connect_cb);
-  pub_point_cloud_ = create_publisher<PointCloud2>("points", rclcpp::SensorDataQoS());
+  pub_point_cloud_ = create_publisher<PointCloud2>(
+      "points", rclcpp::SensorDataQoS()
+    );
+
+  callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(
+          &PointCloudXyzNode::parametersCallback, 
+          this, 
+          std::placeholders::_1
+        )
+    );
+
+  // if(stream_pointcloud_){
+    enable_streaming();
+  // }
+
 }
 
-// Handles (un)subscribing when clients (un)subscribe
-void PointCloudXyzNode::connectCb()
-{
-  std::lock_guard<std::mutex> lock(connect_mutex_);
-  // TODO(ros2) Implement getNumSubscribers when rcl/rmw support it
-  // if (pub_point_cloud_->getNumSubscribers() == 0)
-  if (0) {
-    sub_depth_.shutdown();
-  } else if (!sub_depth_) {
-    auto custom_qos = rmw_qos_profile_system_default;
-    custom_qos.depth = queue_size_;
+rcl_interfaces::msg::SetParametersResult PointCloudXyzNode::parametersCallback(
+      const std::vector<rclcpp::Parameter> &parameters
+    ){
+  rcl_interfaces::msg::SetParametersResult result;
 
-    sub_depth_ = image_transport::create_camera_subscription(
+  try{
+    for (const auto &param: parameters){
+
+      RCLCPP_INFO(logger_, "Parameter: %s", param.get_name().c_str());
+
+      // QUEUE SIZE
+      if(param.get_name()=="queue_size"){
+        queue_size_ = param.as_int();
+        result.successful = true;
+        if(stream_pointcloud_){
+          result.reason = "Queue size updated, it'll take effect the next time the stream is restarted";
+        }else{
+          result.reason = "Queue size updated";
+        }
+      }
+      
+      //  STREAM POINTCLOUD
+      else if(param.get_name()=="stream_pointcloud"){
+        bool new_value = param.as_bool();
+        if(new_value){ // Want to enable
+          if(stream_pointcloud_){
+            result.successful = false;
+            result.reason = "Pointcloud streaming ALREADY enabled";
+          }else{
+            result.successful = true;
+            stream_pointcloud_ = true;
+            result.reason = "Pointcloud stream parameter ENABLED";
+            // enable_streaming();
+          }
+        }else{ // Want to disable
+          if(!stream_pointcloud_){
+            result.successful = false;
+            result.reason = "Pointcloud streaming ALREADY disabled";
+          }else{
+            result.successful = true;
+            stream_pointcloud_ = false;
+            result.reason = "Pointcloud stream parameter DISABLED";
+            // disable_streaming();
+          }
+        }
+      }
+
+      // CLIP DISTANCE
+      else if(param.get_name()=="clip_distance"){
+        clip_distance_ = param.as_double();
+        result.successful = true;
+        if(clip_distance_>0.0){
+          result.reason = "Clip distance updated";
+        }else{
+          result.reason = "Clip distance disabled";
+        }
+      }
+
+      else if(param.get_name()=="min_x"){
+        result.successful = true;
+        result.reason = "min_x updated";
+        min_x_ = param.as_int();
+      }
+
+      else if(param.get_name()=="max_x"){
+        result.successful = true;
+        result.reason = "max_x updated";
+        max_x_ = param.as_int();
+      }
+
+      else if(param.get_name()=="min_y"){
+        result.successful = true;
+        result.reason = "min_y updated";
+        min_y_ = param.as_int();
+      }
+
+      else if(param.get_name()=="max_y"){
+        result.successful = true;
+        result.reason = "max_y updated";
+        max_y_ = param.as_int();
+      }
+
+      else{
+        result.successful = false;
+        result.reason = "Parameter not defined, or can't be edited in runtime";
+      }
+
+    }
+  }catch(const rclcpp::exceptions::InvalidParametersException& e){
+    result.successful = false;
+    result.reason = std::string(e.what());
+  }
+
+  if(result.successful){
+    RCLCPP_INFO(logger_, "%s", result.reason.c_str());
+  }else{
+    RCLCPP_ERROR(logger_, "%s", result.reason.c_str());
+  }
+  
+  return result;
+}
+
+void PointCloudXyzNode::enable_streaming(){
+  auto custom_qos = rmw_qos_profile_sensor_data;
+  custom_qos.depth = queue_size_;
+  sub_depth_ = image_transport::create_camera_subscription(
       this,
       "image_rect",
-      std::bind(&PointCloudXyzNode::depthCb, this, std::placeholders::_1, std::placeholders::_2),
+      std::bind(
+          &PointCloudXyzNode::depthCb, 
+          this, 
+          std::placeholders::_1, 
+          std::placeholders::_2
+        ),
       "raw",
-      custom_qos);
-  }
+      custom_qos
+    );
+  RCLCPP_INFO(logger_, "Pointcloud streaming ENABLED");
+}
+
+void PointCloudXyzNode::disable_streaming(){
+  sub_depth_.shutdown();
+  RCLCPP_INFO(logger_, "Pointcloud streaming DISABLED");
 }
 
 void PointCloudXyzNode::depthCb(
   const Image::ConstSharedPtr & depth_msg,
   const CameraInfo::ConstSharedPtr & info_msg)
 {
-  auto cloud_msg = std::make_shared<PointCloud2>();
-  cloud_msg->header = depth_msg->header;
-  cloud_msg->height = depth_msg->height;
-  cloud_msg->width = depth_msg->width;
-  cloud_msg->is_dense = false;
-  cloud_msg->is_bigendian = false;
+  if(stream_pointcloud_){
+    auto cloud_msg = std::make_shared<PointCloud2>();
+    cloud_msg->header = depth_msg->header;
+    cloud_msg->height = depth_msg->height;
+    cloud_msg->width = depth_msg->width;
+    cloud_msg->is_dense = false;
+    cloud_msg->is_bigendian = false;
 
-  sensor_msgs::PointCloud2Modifier pcd_modifier(*cloud_msg);
-  pcd_modifier.setPointCloud2FieldsByString(1, "xyz");
+    sensor_msgs::PointCloud2Modifier pcd_modifier(*cloud_msg);
+    pcd_modifier.setPointCloud2FieldsByString(1, "xyz");
 
-  // Update camera model
-  model_.fromCameraInfo(info_msg);
+    // Update camera model
+    model_.fromCameraInfo(info_msg);
 
-  if (depth_msg->encoding == enc::TYPE_16UC1) {
-    convert<uint16_t>(depth_msg, cloud_msg, model_);
-  } else if (depth_msg->encoding == enc::TYPE_32FC1) {
-    convert<float>(depth_msg, cloud_msg, model_);
-  } else {
-    RCLCPP_ERROR(logger_, "Depth image has unsupported encoding [%s]", depth_msg->encoding.c_str());
-    return;
+    // Convert Depth Image to Pointcloud
+    if (depth_msg->encoding == enc::TYPE_16UC1 || depth_msg->encoding == enc::MONO16) {
+      convertDepth<uint16_t>(
+          depth_msg, 
+          cloud_msg, 
+          model_, 
+          0.0, 
+          (uint16_t)clip_distance_, 
+          min_x_,
+          max_x_,
+          min_y_,
+          max_y_
+        );
+    } else if (depth_msg->encoding == enc::TYPE_32FC1) {
+      convertDepth<float>(
+          depth_msg, 
+          cloud_msg, 
+          model_, 
+          0.0, 
+          clip_distance_,
+          min_x_,
+          max_x_,
+          min_y_,
+          max_y_
+        );
+    } else {
+      RCLCPP_ERROR(logger_, "Depth image has unsupported encoding [%s]", depth_msg->encoding.c_str());
+      return;
+    }
+
+    pub_point_cloud_->publish(*cloud_msg);
   }
-
-  pub_point_cloud_->publish(*cloud_msg);
 }
 
 }  // namespace depth_image_proc
